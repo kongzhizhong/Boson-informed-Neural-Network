@@ -1,0 +1,1009 @@
+#!/usr/bin/env python3
+"""Standalone BINN stress test for the three-dimensional trapped Bose gas.
+
+This script runs the single large-scale VMC calculation discussed in
+Section 4.2.3 of the manuscript.  It intentionally contains no DMC code and
+has no imports from the rest of the research repository.
+
+The default run uses the manuscript parameters
+
+    d = 3, N = 350, g_GP = 100, sigma = 10/N, omega = 1, ell = 1,
+    B = 256, R = 32,
+    one-body network: two hidden layers of width 64,
+    pair residual: one hidden layer of width 32,
+    2500 SR iterations, eta_t = 0.016/(1+t/400), SR damping = 1e-3,
+    and five MALA moves per SR iteration.
+
+The implementation follows the paper directly:
+
+* the bosonic backbone is a particle-shared, positive rank-R TNN;
+* the harmonic potential is included through a trainable analytic envelope;
+* the pair branch is a principal-Neumann-cell Jastrow factor plus an MLP in
+  r^2;
+* the TNN coordinate Laplacian is evaluated exactly using the pooled identity,
+  without a full dN-by-dN Hessian or a stochastic trace estimator;
+* stochastic reconfiguration is solved in the B-dimensional sample space.
+
+All B=256 walkers and all N(N-1)/2 particle pairs are evaluated in parallel.
+On a smaller accelerator, the same independent walker and pair axes may be
+chunked without changing the mathematical estimator.
+
+Dependencies: Python >= 3.10, NumPy >= 2.0, SciPy, PyTorch >= 2.0, and
+Matplotlib.
+
+Full paper run (a CUDA GPU with about 16 GB memory is recommended):
+
+    python binn_3d_stress_test.py
+
+Fast execution check, retaining N=350 but reducing the Monte Carlo batch and
+iteration counts:
+
+    python binn_3d_stress_test.py --smoke --device cpu
+
+Results are written to ``binn_3d_stress_output`` unless ``--output-dir`` is
+given.  Numerical settings for the full run are collected in ``Config``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import time
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+
+import numpy as np
+import torch
+from scipy.integrate import solve_ivp
+from scipy.interpolate import CubicSpline
+from scipy.optimize import brentq
+from torch import Tensor, nn
+from torch.func import functional_call, grad as function_grad, vmap
+
+
+@dataclass(frozen=True)
+class Config:
+    """Physical and numerical parameters of the published stress test."""
+
+    dimension: int = 3
+    particles: int = 350
+    g_gp: float = 100.0
+    range_scale: float = 10.0
+    omega: float = 1.0
+    cell_radius: float = 1.0
+
+    batch_size: int = 256
+    rank: int = 32
+    one_body_width: int = 64
+    pair_width: int = 32
+    training_steps: int = 2500
+    learning_rate: float = 0.016
+    learning_rate_decay: float = 400.0
+    sr_damping: float = 1.0e-3
+
+    mala_moves: int = 5
+    mala_target_acceptance: float = 0.574
+    mala_adaptation_rate: float = 0.05
+    mala_min_step: float = 1.0e-4
+    mala_max_step: float = 0.12
+    initial_mala_step: float = 0.0051
+    initial_warmup_rounds: int = 80
+    initial_warmup_moves: int = 3
+
+    energy_clip_mad: float = 5.0
+    sr_max_direction_norm: float = 20.0
+    tail_steps: int = 400
+    log_every: int = 20
+    density_sweeps: int = 800
+    density_mala_moves: int = 5
+    radial_bin_width: float = 0.08
+    radial_maximum: float = 6.0
+
+    seed: int = 42
+
+    # The limiting GP reference uses g_eff = 4*pi*a_0 and the scattering
+    # length reported in Table 4.2 of the manuscript.
+    scaled_scattering_length: float = 4.9189
+    gp_grid_points: int = 300
+    gp_radius: float = 12.0
+    gp_time_step: float = 1.0e-4
+    gp_max_steps: int = 500000
+    gp_tolerance: float = 1.0e-11
+
+    @property
+    def sigma(self) -> float:
+        return self.range_scale / self.particles
+
+    @property
+    def pair_coupling(self) -> float:
+        return self.g_gp / self.particles
+
+    @property
+    def effective_gp_coupling(self) -> float:
+        return 4.0 * math.pi * self.scaled_scattering_length
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Standalone N=350 BINN VMC stress test (no DMC)."
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="PyTorch device, for example cuda, cuda:0, or cpu (default: auto).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("binn_3d_stress_output"),
+        help="Directory for data, checkpoint, and figure.",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run a short N=350 execution check instead of the full experiment.",
+    )
+    return parser.parse_args()
+
+
+def resolve_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("a CUDA device was requested, but CUDA is unavailable")
+    return device
+
+
+def make_config(smoke: bool) -> Config:
+    config = Config()
+    if smoke:
+        # Keep the physical stress-test size N=350 so the large-N tensor shapes
+        # are exercised, but make the run quick enough for a CPU check.
+        config = replace(
+            config,
+            batch_size=4,
+            training_steps=2,
+            initial_warmup_rounds=1,
+            initial_warmup_moves=1,
+            tail_steps=2,
+            log_every=1,
+            density_sweeps=2,
+            density_mala_moves=1,
+        )
+
+    return config
+
+
+def seed_everything(seed: int, device: torch.device) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+
+def solve_neumann_cell(config: Config) -> tuple[float, np.ndarray, np.ndarray]:
+    """Solve the principal radial Neumann cell problem.
+
+    The returned logarithm is shifted so that u_c(ell)=0, equivalently
+    f_sigma(ell)=1, exactly as specified in the manuscript.
+    """
+
+    d = config.dimension
+    sigma = config.sigma
+    coupling = config.pair_coupling
+    ell = config.cell_radius
+    r_start = min(1.0e-7, sigma * 1.0e-5)
+
+    def potential(radius: float) -> float:
+        prefactor = coupling / (sigma * math.sqrt(math.pi)) ** d
+        return prefactor * math.exp(-(radius / sigma) ** 2)
+
+    def integrate(eigenvalue: float, *, dense: bool = False):
+        initial_slope = (potential(0.0) - eigenvalue) * r_start / d
+        return solve_ivp(
+            lambda radius, state: (
+                state[1],
+                (potential(radius) - eigenvalue) * state[0]
+                - (d - 1) * state[1] / radius,
+            ),
+            (r_start, ell),
+            (1.0, initial_slope),
+            dense_output=dense,
+            rtol=1.0e-10,
+            atol=1.0e-12,
+            max_step=min(ell / 1000.0, sigma / 20.0),
+        )
+
+    def boundary_residual(eigenvalue: float) -> float:
+        solution = integrate(eigenvalue)
+        if not solution.success:
+            raise RuntimeError(f"cell ODE failed: {solution.message}")
+        return float(solution.y[1, -1])
+
+    unit_ball_volume = math.pi ** (d / 2.0) * ell**d / math.gamma(d / 2.0 + 1.0)
+    lower = 0.0
+    upper = coupling / unit_ball_volume
+    residual_lower = boundary_residual(lower)
+    residual_upper = boundary_residual(upper)
+    while residual_lower * residual_upper > 0.0:
+        upper *= 2.0
+        residual_upper = boundary_residual(upper)
+        if upper > potential(0.0):
+            raise RuntimeError("failed to bracket the principal cell eigenvalue")
+
+    eigenvalue = brentq(
+        boundary_residual,
+        lower,
+        upper,
+        xtol=1.0e-12,
+        rtol=1.0e-12,
+    )
+    solution = integrate(eigenvalue, dense=True)
+    radii = np.linspace(r_start, ell, 6000)
+    values = solution.sol(radii)[0]
+    if np.any(values <= 0.0):
+        raise RuntimeError("the computed principal cell eigenfunction is not positive")
+
+    # Insert the regular origin and impose the manuscript normalization.
+    radii = np.concatenate(([0.0], radii))
+    values = np.concatenate(([1.0], values))
+    values /= values[-1]
+    log_values = np.log(values)
+    log_values -= log_values[-1]
+    return float(eigenvalue), radii, log_values
+
+
+class CellJastrow(nn.Module):
+    """Differentiable cubic-spline representation of u_c=log(f_sigma)."""
+
+    def __init__(self, radii: np.ndarray, values: np.ndarray, ell: float):
+        super().__init__()
+        spline = CubicSpline(
+            radii,
+            values,
+            bc_type=((1, 0.0), (1, 0.0)),
+        )
+        self.register_buffer("knots", torch.tensor(radii, dtype=torch.float32))
+        self.register_buffer(
+            "coefficients", torch.tensor(spline.c, dtype=torch.float32)
+        )
+        self.ell = float(ell)
+
+    def forward(self, radii: Tensor) -> Tensor:
+        shape = radii.shape
+        flat = radii.reshape(-1)
+        inside_radius = flat.clamp(min=0.0, max=self.ell - 1.0e-7)
+        index = torch.searchsorted(
+            self.knots[1:-1].contiguous(), inside_radius.contiguous()
+        )
+        displacement = inside_radius - self.knots[index]
+        c0 = self.coefficients[0, index]
+        c1 = self.coefficients[1, index]
+        c2 = self.coefficients[2, index]
+        c3 = self.coefficients[3, index]
+        value = ((c0 * displacement + c1) * displacement + c2) * displacement + c3
+        value = torch.where(flat <= self.ell, value, torch.zeros_like(value))
+        return value.reshape(shape)
+
+
+class BINN(nn.Module):
+    """Boson-informed neural wave function used by the stress test."""
+
+    def __init__(
+        self,
+        config: Config,
+        cell_radii: np.ndarray,
+        cell_values: np.ndarray,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.omega = config.omega
+
+        self.one_body = nn.Sequential(
+            nn.Linear(config.dimension, config.one_body_width),
+            nn.Tanh(),
+            nn.Linear(config.one_body_width, config.one_body_width),
+            nn.Tanh(),
+            nn.Linear(config.one_body_width, config.rank),
+        )
+        self.branch_weights = nn.Parameter(torch.randn(config.rank) * 0.01)
+        self.envelope_coefficient = nn.Parameter(torch.tensor([1.0]))
+        self.pair_residual = nn.Sequential(
+            nn.Linear(1, config.pair_width),
+            nn.Tanh(),
+            nn.Linear(config.pair_width, 1),
+        )
+        self.cell_jastrow = CellJastrow(
+            cell_radii, cell_values, config.cell_radius
+        )
+
+        pair_i, pair_j = torch.triu_indices(
+            config.particles, config.particles, offset=1
+        )
+        self.register_buffer("pair_i", pair_i)
+        self.register_buffer("pair_j", pair_j)
+
+        for layer in list(self.one_body.modules()) + list(
+            self.pair_residual.modules()
+        ):
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight, gain=0.1)
+                nn.init.zeros_(layer.bias)
+
+    def tnn_log_amplitude(self, coordinates: Tensor) -> Tensor:
+        radius_sq = coordinates.square().sum(dim=-1, keepdim=True)
+        external = 0.5 * self.omega**2 * radius_sq
+        log_orbitals = (
+            self.one_body(coordinates)
+            - self.envelope_coefficient.abs() * external
+        )
+        pooled = log_orbitals.sum(dim=1) + self.branch_weights
+        return torch.logsumexp(pooled, dim=-1)
+
+    def pair_geometry(self, coordinates: Tensor) -> tuple[Tensor, Tensor]:
+        differences = coordinates[:, self.pair_i] - coordinates[:, self.pair_j]
+        radii = torch.linalg.vector_norm(differences, dim=-1)
+        return radii, radii.square()
+
+    def pair_radii(self, coordinates: Tensor) -> Tensor:
+        return self.pair_geometry(coordinates)[0]
+
+    def pair_log_value(self, radii: Tensor) -> Tensor:
+        return self.cell_jastrow(radii) + self.pair_residual(
+            radii.square().unsqueeze(-1)
+        ).squeeze(-1)
+
+    def pair_log_sum(self, radii: Tensor) -> Tensor:
+        return self.pair_log_value(radii).sum(dim=1)
+
+    def forward(self, coordinates: Tensor) -> Tensor:
+        if coordinates.ndim != 3:
+            raise ValueError("coordinates must have shape (B,N,3)")
+        if coordinates.shape[1:] != (
+            self.config.particles,
+            self.config.dimension,
+        ):
+            raise ValueError(
+                "expected each configuration to have shape "
+                f"({self.config.particles},{self.config.dimension}), got "
+                f"{tuple(coordinates.shape[1:])}"
+            )
+        radii = self.pair_radii(coordinates)
+        return self.tnn_log_amplitude(coordinates) + self.pair_log_sum(radii)
+
+
+def value_jacobian_laplacian(
+    network: nn.Sequential, points: Tensor
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Propagate values, coordinate Jacobians, and Laplacians through an MLP."""
+
+    count, dimension = points.shape
+    values = points
+    jacobian = torch.eye(
+        dimension, device=points.device, dtype=points.dtype
+    ).expand(count, dimension, dimension)
+    laplacian = torch.zeros(
+        count, dimension, device=points.device, dtype=points.dtype
+    )
+
+    for layer in network:
+        if isinstance(layer, nn.Linear):
+            values = values @ layer.weight.detach().t()
+            if layer.bias is not None:
+                values = values + layer.bias.detach()
+            jacobian = torch.einsum("oi,pid->pod", layer.weight.detach(), jacobian)
+            laplacian = laplacian @ layer.weight.detach().t()
+        elif isinstance(layer, nn.Tanh):
+            outputs = torch.tanh(values)
+            first = 1.0 - outputs.square()
+            second = -2.0 * outputs * first
+            laplacian = second * jacobian.square().sum(-1) + first * laplacian
+            jacobian = first.unsqueeze(-1) * jacobian
+            values = outputs
+        else:
+            raise TypeError(
+                "the exact pooled Laplacian supports only Linear and Tanh layers"
+            )
+    return values, jacobian, laplacian
+
+
+@torch.no_grad()
+def pooled_tnn_laplacian(model: BINN, coordinates: Tensor) -> Tensor:
+    """Evaluate equation (3.13) of the manuscript exactly."""
+
+    batch, particles, dimension = coordinates.shape
+    points = coordinates.reshape(-1, dimension)
+    values, jacobian, laplacian = value_jacobian_laplacian(
+        model.one_body, points
+    )
+
+    alpha = model.envelope_coefficient.detach().abs()
+    omega_sq = model.omega**2
+    radius_sq = points.square().sum(dim=-1, keepdim=True)
+    log_orbitals = values - 0.5 * alpha * omega_sq * radius_sq
+    orbital_gradients = jacobian - (alpha * omega_sq * points).unsqueeze(1)
+    orbital_laplacians = laplacian - alpha * omega_sq * dimension
+
+    rank = model.config.rank
+    log_orbitals = log_orbitals.reshape(batch, particles, rank)
+    orbital_gradients = orbital_gradients.reshape(
+        batch, particles, rank, dimension
+    )
+    orbital_laplacians = orbital_laplacians.reshape(batch, particles, rank)
+
+    pooled = log_orbitals.sum(dim=1) + model.branch_weights.detach()
+    weights = torch.softmax(pooled, dim=-1)
+    particle_weights = weights[:, None, :]
+
+    mean_laplacian = (particle_weights * orbital_laplacians).sum(dim=-1)
+    mean_gradient_sq = (
+        particle_weights * orbital_gradients.square().sum(dim=-1)
+    ).sum(dim=-1)
+    mean_gradient = (
+        particle_weights[..., None] * orbital_gradients
+    ).sum(dim=2)
+    return (
+        mean_laplacian
+        + mean_gradient_sq
+        - mean_gradient.square().sum(dim=-1)
+    ).sum(dim=1)
+
+
+def pair_laplacian(model: BINN, pair_radii: Tensor) -> Tensor:
+    """Return 2*sum_{i<j} Delta_rad u(r_ij), using exact radial AD."""
+
+    batch, number_of_pairs = pair_radii.shape
+    dimension = model.config.dimension
+    differentiable_radii = pair_radii.detach().reshape(-1).requires_grad_(True)
+    values = model.pair_log_value(differentiable_radii)
+    first = torch.autograd.grad(
+        values.sum(), differentiable_radii, create_graph=True
+    )[0]
+    second = torch.autograd.grad(first.sum(), differentiable_radii)[0]
+    # For the measure-zero case r=0, smooth radial regularity gives
+    # lim_{r->0} u'(r)/r = u''(0).
+    radial_ratio = torch.where(
+        differentiable_radii > 0.0,
+        first / differentiable_radii.clamp_min(
+            torch.finfo(differentiable_radii.dtype).tiny
+        ),
+        second,
+    )
+    radial_trace = 2.0 * (second + (dimension - 1) * radial_ratio)
+    return radial_trace.detach().reshape(batch, number_of_pairs).sum(dim=1)
+
+
+def local_energy(model: BINN, coordinates: Tensor, config: Config) -> Tensor:
+    """Evaluate the exact local energy for all walkers in parallel."""
+
+    differentiable_coordinates = coordinates.detach().requires_grad_(True)
+    log_amplitude = model(differentiable_coordinates)
+    log_gradient = torch.autograd.grad(
+        log_amplitude.sum(), differentiable_coordinates
+    )[0].detach()
+    gradient_sq = log_gradient.square().sum(dim=(1, 2))
+
+    fixed_coordinates = coordinates.detach()
+    tnn_trace = pooled_tnn_laplacian(model, fixed_coordinates)
+    radii, squared_distances = model.pair_geometry(fixed_coordinates)
+    pair_trace = pair_laplacian(model, radii)
+    kinetic = -0.5 * (tnn_trace + pair_trace + gradient_sq)
+
+    external = (
+        0.5
+        * config.omega**2
+        * fixed_coordinates.square().sum(dim=(1, 2))
+    )
+    prefactor = config.pair_coupling / (
+        config.sigma * math.sqrt(math.pi)
+    ) ** config.dimension
+    interaction = (
+        prefactor * torch.exp(-squared_distances / config.sigma**2)
+    ).sum(dim=1)
+    return (kinetic + external + interaction).detach()
+
+
+def log_amplitude_and_drift(model: BINN, coordinates: Tensor) -> tuple[Tensor, Tensor]:
+    """Evaluate log(Psi) and the MALA drift for the full walker batch."""
+
+    differentiable_coordinates = coordinates.detach().requires_grad_(True)
+    values = model(differentiable_coordinates)
+    gradients = torch.autograd.grad(values.sum(), differentiable_coordinates)[0]
+    return values.detach(), (2.0 * gradients).detach()
+
+
+def mala_sample(
+    model: BINN,
+    coordinates: Tensor,
+    step_size: float,
+    moves: int,
+    *,
+    metropolis_adjusted: bool,
+) -> tuple[Tensor, float]:
+    """Sample |Psi|^2 by MALA (or unadjusted Langevin during warm-up)."""
+
+    coordinates = coordinates.detach()
+    log_value, drift = log_amplitude_and_drift(model, coordinates)
+    accepted = 0
+    attempted = 0
+    noise_scale = math.sqrt(2.0 * step_size)
+
+    for _ in range(moves):
+        proposal = (
+            coordinates
+            + step_size * drift
+            + noise_scale * torch.randn_like(coordinates)
+        )
+        proposal_value, proposal_drift = log_amplitude_and_drift(model, proposal)
+
+        if metropolis_adjusted:
+            forward_residual = proposal - coordinates - step_size * drift
+            backward_residual = coordinates - proposal - step_size * proposal_drift
+            log_ratio = (
+                2.0 * (proposal_value - log_value)
+                + forward_residual.square().sum(dim=(1, 2)) / (4.0 * step_size)
+                - backward_residual.square().sum(dim=(1, 2)) / (4.0 * step_size)
+            )
+            accept = torch.rand(
+                coordinates.shape[0], device=coordinates.device
+            ) < torch.exp(log_ratio.clamp(max=0.0))
+            mask = accept[:, None, None]
+            coordinates = torch.where(mask, proposal, coordinates)
+            log_value = torch.where(accept, proposal_value, log_value)
+            drift = torch.where(mask, proposal_drift, drift)
+            accepted += int(accept.sum().item())
+            attempted += accept.numel()
+        else:
+            coordinates = proposal
+            log_value = proposal_value
+            drift = proposal_drift
+
+    acceptance = accepted / attempted if metropolis_adjusted else 1.0
+    return coordinates.detach(), acceptance
+
+
+def clip_local_energy(energy: Tensor, multiple: float) -> Tensor:
+    median = energy.median()
+    mad = (energy - median).abs().median().clamp_min(1.0e-8)
+    return energy.clamp(median - multiple * mad, median + multiple * mad)
+
+
+def score_matrix(model: BINN, coordinates: Tensor) -> Tensor:
+    """Compute O_sk = partial log(Psi_s)/partial theta_k in parallel."""
+
+    parameter_names = [
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    ]
+    parameters = {
+        name: parameter.detach()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+
+    def single_log_amplitude(parameter_values, one_configuration):
+        return functional_call(
+            model,
+            parameter_values,
+            (one_configuration.unsqueeze(0),),
+            strict=False,
+        ).squeeze(0)
+
+    derivative = function_grad(single_log_amplitude)
+    gradients = vmap(derivative, in_dims=(None, 0))(parameters, coordinates)
+    return torch.cat(
+        [
+            gradients[name].reshape(coordinates.shape[0], -1)
+            for name in parameter_names
+        ],
+        dim=1,
+    ).detach()
+
+
+def stochastic_reconfiguration_step(
+    model: BINN,
+    coordinates: Tensor,
+    centered_energy: Tensor,
+    learning_rate: float,
+    config: Config,
+) -> float:
+    """Apply the B-dimensional Woodbury form of the paper's SR update."""
+
+    scores = score_matrix(model, coordinates)
+    batch = scores.shape[0]
+    centered_scores = scores - scores.mean(dim=0, keepdim=True)
+    sample_metric = centered_scores @ centered_scores.t() / batch
+    # The published 1e-3 setting is the relative damping coefficient used by
+    # the stress-test runner.  Scaling it by the mean sample-metric diagonal
+    # makes the regularizer invariant to the overall score magnitude.
+    effective_regularization = (
+        config.sr_damping
+        * (1.0 + sample_metric.diagonal().abs().mean().item())
+        + 1.0e-6
+    )
+    system = sample_metric + effective_regularization * torch.eye(
+        batch, device=scores.device, dtype=scores.dtype
+    )
+
+    try:
+        factor = torch.linalg.cholesky(system)
+        dual = torch.cholesky_solve(
+            centered_energy[:, None], factor
+        ).squeeze(1)
+    except torch._C._LinAlgError:
+        dual = torch.linalg.lstsq(
+            system, centered_energy[:, None]
+        ).solution.squeeze(1)
+
+    direction = centered_scores.t() @ dual
+    direction_norm = direction.norm()
+    if direction_norm > config.sr_max_direction_norm:
+        direction = direction * (
+            config.sr_max_direction_norm / direction_norm
+        )
+
+    with torch.no_grad():
+        offset = 0
+        scale = -2.0 * learning_rate / batch
+        for parameter in model.parameters():
+            if not parameter.requires_grad:
+                continue
+            size = parameter.numel()
+            parameter.add_(direction[offset : offset + size].view_as(parameter), alpha=scale)
+            offset += size
+    if offset != direction.numel():
+        raise RuntimeError("SR parameter packing is inconsistent")
+    return effective_regularization
+
+
+def gp_reference(config: Config) -> tuple[float, np.ndarray, np.ndarray]:
+    """Compute the radial contact-GP reference by normalized imaginary time."""
+
+    points = config.gp_grid_points
+    radius_max = config.gp_radius
+    dr = radius_max / points
+    radii = (np.arange(points) + 0.5) * dr
+    orbital = np.exp(-0.5 * config.omega * radii**2)
+
+    def normalize(values: np.ndarray) -> np.ndarray:
+        norm = 4.0 * math.pi * np.trapezoid(values**2 * radii**2, radii)
+        return values / math.sqrt(norm)
+
+    def radial_laplacian(values: np.ndarray) -> np.ndarray:
+        extended = np.empty(points + 2)
+        extended[0] = values[0]
+        extended[1:-1] = values
+        extended[-1] = 0.0
+        second = (extended[2:] - 2.0 * extended[1:-1] + extended[:-2]) / dr**2
+        first = (extended[2:] - extended[:-2]) / (2.0 * dr)
+        return second + 2.0 * first / radii
+
+    orbital = normalize(orbital)
+    previous_mu: float | None = None
+    coupling = config.effective_gp_coupling
+    for step in range(config.gp_max_steps):
+        laplacian = radial_laplacian(orbital)
+        orbital = orbital + config.gp_time_step * (
+            0.5 * laplacian
+            - 0.5 * config.omega**2 * radii**2 * orbital
+            - coupling * orbital**3
+        )
+        orbital = normalize(np.maximum(orbital, 0.0))
+        if step > 10000 and step % 2000 == 0:
+            laplacian = radial_laplacian(orbital)
+            chemical_potential = 4.0 * math.pi * np.trapezoid(
+                (
+                    -0.5 * laplacian
+                    + 0.5 * config.omega**2 * radii**2 * orbital
+                    + coupling * orbital**3
+                )
+                * orbital
+                * radii**2,
+                radii,
+            )
+            if (
+                previous_mu is not None
+                and abs(chemical_potential - previous_mu) < config.gp_tolerance
+            ):
+                break
+            previous_mu = float(chemical_potential)
+
+    extended = np.empty(points + 2)
+    extended[0] = orbital[0]
+    extended[1:-1] = orbital
+    extended[-1] = 0.0
+    derivative = (extended[2:] - extended[:-2]) / (2.0 * dr)
+    kinetic = 4.0 * math.pi * np.trapezoid(
+        0.5 * derivative**2 * radii**2, radii
+    )
+    potential = 4.0 * math.pi * np.trapezoid(
+        0.5 * config.omega**2 * radii**4 * orbital**2, radii
+    )
+    interaction = 4.0 * math.pi * np.trapezoid(
+        0.5 * coupling * orbital**4 * radii**2, radii
+    )
+    energy = float(kinetic + potential + interaction)
+    radial_mass = 4.0 * math.pi * radii**2 * orbital**2
+    radial_mass /= np.trapezoid(radial_mass, radii)
+    return energy, radii, radial_mass
+
+
+def moving_average(values: np.ndarray, half_width: int = 5) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    return np.asarray(
+        [
+            values[max(0, i - half_width) : min(len(values), i + half_width + 1)].mean()
+            for i in range(len(values))
+        ]
+    )
+
+
+def save_figure(
+    output_directory: Path,
+    trajectory_steps: np.ndarray,
+    trajectory_energy: np.ndarray,
+    trajectory_cv: np.ndarray,
+    radial_centers: np.ndarray,
+    radial_mass: np.ndarray,
+    gp_radial_mass: np.ndarray,
+    gp_energy: float,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_steps = trajectory_steps.astype(float).copy()
+    plot_steps[plot_steps == 0.0] = 1.0
+    color = "#d62728"
+    figure, axes = plt.subplots(1, 3, figsize=(9.0, 2.9))
+
+    axes[0].plot(plot_steps, moving_average(trajectory_energy), color=color)
+    axes[0].axhline(gp_energy, color="0.45", linestyle=":", label="GP limit")
+    axes[0].set_xscale("log")
+    axes[0].set_xlabel("SR step")
+    axes[0].set_ylabel(r"$E_{\rm BINN}/N$")
+    axes[0].set_title("(a) energy", loc="left")
+    axes[0].legend(frameon=False)
+
+    axes[1].plot(plot_steps, moving_average(trajectory_cv), color=color)
+    axes[1].set_xscale("log")
+    axes[1].set_yscale("log")
+    axes[1].set_xlabel("SR step")
+    axes[1].set_ylabel(r"$\mathrm{CV}(E_L)$")
+    axes[1].set_title("(b) relative fluctuation", loc="left")
+
+    axes[2].plot(radial_centers, radial_mass, color=color, label="BINN")
+    axes[2].plot(
+        radial_centers[::4],
+        gp_radial_mass[::4],
+        linestyle="none",
+        marker="o",
+        markersize=3.0,
+        color="0.45",
+        label="GP",
+    )
+    axes[2].set_xlabel(r"$r$")
+    axes[2].set_ylabel(r"$4\pi r^2\rho(r)$")
+    axes[2].set_title("(c) radial density", loc="left")
+    axes[2].legend(frameon=False)
+
+    figure.tight_layout()
+    figure.savefig(output_directory / "stress_test.pdf")
+    figure.savefig(output_directory / "stress_test.png", dpi=220)
+    plt.close(figure)
+
+
+def run(config: Config, device: torch.device, output_directory: Path) -> None:
+    output_directory.mkdir(parents=True, exist_ok=True)
+    seed_everything(config.seed, device)
+    started = time.time()
+
+    print("BINN three-dimensional stress test (VMC only)", flush=True)
+    print(
+        f"device={device} N={config.particles} B={config.batch_size} "
+        f"R={config.rank} sigma={config.sigma:.8f} steps={config.training_steps}",
+        flush=True,
+    )
+
+    print("solving the principal Neumann cell problem ...", flush=True)
+    cell_eigenvalue, cell_radii, cell_values = solve_neumann_cell(config)
+    print(
+        f"cell eigenvalue={cell_eigenvalue:.10f}; "
+        f"u_c(ell)={cell_values[-1]:.3e}",
+        flush=True,
+    )
+
+    print("computing the contact-GP radial reference ...", flush=True)
+    gp_energy, gp_radii, gp_mass = gp_reference(config)
+    print(f"e_GP={gp_energy:.6f}", flush=True)
+
+    model = BINN(config, cell_radii, cell_values).to(device)
+    walkers = 0.7 * torch.randn(
+        config.batch_size,
+        config.particles,
+        config.dimension,
+        device=device,
+    )
+    mala_step = config.initial_mala_step
+
+    print("warming up Gaussian-initialized walkers ...", flush=True)
+    for _ in range(config.initial_warmup_rounds):
+        walkers, _ = mala_sample(
+            model,
+            walkers,
+            mala_step,
+            config.initial_warmup_moves,
+            metropolis_adjusted=False,
+        )
+
+    recorded_steps: list[int] = []
+    recorded_energy: list[float] = []
+    recorded_cv: list[float] = []
+    recorded_acceptance: list[float] = []
+    recorded_mala_step: list[float] = []
+    recorded_sr_regularization: list[float] = []
+    tail_energy: list[float] = []
+    tail_cv: list[float] = []
+
+    print("starting VMC/SR optimization ...", flush=True)
+    for step in range(config.training_steps):
+        walkers, acceptance = mala_sample(
+            model,
+            walkers,
+            mala_step,
+            config.mala_moves,
+            metropolis_adjusted=True,
+        )
+        mala_step = min(
+            config.mala_max_step,
+            max(
+                config.mala_min_step,
+                mala_step
+                * math.exp(
+                    config.mala_adaptation_rate
+                    * (acceptance - config.mala_target_acceptance)
+                ),
+            ),
+        )
+
+        energy = local_energy(model, walkers, config)
+        clipped_energy = clip_local_energy(energy, config.energy_clip_mad)
+        eta = config.learning_rate / (
+            1.0 + step / config.learning_rate_decay
+        )
+        effective_regularization = stochastic_reconfiguration_step(
+            model,
+            walkers,
+            clipped_energy - clipped_energy.mean(),
+            eta,
+            config,
+        )
+
+        energy_per_particle = float(energy.mean().item() / config.particles)
+        cv = float(energy.std(unbiased=True).item() / abs(energy.mean().item()))
+        if step >= max(0, config.training_steps - config.tail_steps):
+            tail_energy.append(energy_per_particle)
+            tail_cv.append(cv)
+
+        if step % config.log_every == 0 or step == config.training_steps - 1:
+            recorded_steps.append(step)
+            recorded_energy.append(energy_per_particle)
+            recorded_cv.append(cv)
+            recorded_acceptance.append(acceptance)
+            recorded_mala_step.append(mala_step)
+            recorded_sr_regularization.append(effective_regularization)
+            print(
+                f"step={step:5d} E/N={energy_per_particle:.6f} "
+                f"CV={cv:.4e} acc={acceptance:.3f} "
+                f"tau={mala_step:.5f} eta={eta:.5f} "
+                f"lambda_eff={effective_regularization:.3e}",
+                flush=True,
+            )
+
+    final_energy = float(np.mean(tail_energy))
+    tail_energy_standard_deviation = float(
+        np.std(tail_energy, ddof=1)
+        if len(tail_energy) > 1
+        else 0.0
+    )
+    final_cv = float(np.mean(tail_cv))
+
+    print("sampling the post-training radial density ...", flush=True)
+    radial_edges = np.arange(
+        0.0,
+        config.radial_maximum + 0.5 * config.radial_bin_width,
+        config.radial_bin_width,
+    )
+    radial_centers = 0.5 * (radial_edges[:-1] + radial_edges[1:])
+    counts = np.zeros(len(radial_centers), dtype=np.int64)
+    for _ in range(config.density_sweeps):
+        walkers, _ = mala_sample(
+            model,
+            walkers,
+            mala_step,
+            config.density_mala_moves,
+            metropolis_adjusted=True,
+        )
+        radii = walkers.norm(dim=-1).detach().cpu().numpy().reshape(-1)
+        counts += np.histogram(radii, bins=radial_edges)[0]
+    total_radial_samples = (
+        config.density_sweeps * config.batch_size * config.particles
+    )
+    radial_mass = counts / (total_radial_samples * config.radial_bin_width)
+
+    gp_mass_on_bins = np.interp(radial_centers, gp_radii, gp_mass)
+    gp_mass_on_bins /= np.sum(gp_mass_on_bins) * config.radial_bin_width
+    density_l1 = float(
+        np.sum(np.abs(radial_mass - gp_mass_on_bins))
+        * config.radial_bin_width
+    )
+
+    trajectory = {
+        "steps": np.asarray(recorded_steps, dtype=np.int64),
+        "energy_per_particle": np.asarray(recorded_energy),
+        "cv_local_energy": np.asarray(recorded_cv),
+        "acceptance": np.asarray(recorded_acceptance),
+        "mala_step": np.asarray(recorded_mala_step),
+        "effective_sr_regularization": np.asarray(recorded_sr_regularization),
+        "radial_centers": radial_centers,
+        "radial_mass": radial_mass,
+        "gp_radial_mass": gp_mass_on_bins,
+        "final_energy_per_particle": final_energy,
+        # This is a training-trajectory diagnostic, not an iid Monte Carlo error.
+        "tail_step_standard_deviation": tail_energy_standard_deviation,
+        "final_cv_local_energy": final_cv,
+        "density_l1_to_gp": density_l1,
+        "gp_energy": gp_energy,
+        "cell_eigenvalue": cell_eigenvalue,
+    }
+    np.savez_compressed(output_directory / "stress_test_data.npz", **trajectory)
+
+    checkpoint = {
+        "model_state": {
+            name: value.detach().cpu() for name, value in model.state_dict().items()
+        },
+        "walkers": walkers.detach().cpu(),
+        "config": asdict(config),
+        "final_mala_step": mala_step,
+        "cell_eigenvalue": cell_eigenvalue,
+    }
+    torch.save(checkpoint, output_directory / "stress_test_checkpoint.pt")
+
+    elapsed = time.time() - started
+    save_figure(
+        output_directory,
+        trajectory["steps"],
+        trajectory["energy_per_particle"],
+        trajectory["cv_local_energy"],
+        trajectory["radial_centers"],
+        trajectory["radial_mass"],
+        trajectory["gp_radial_mass"],
+        gp_energy,
+    )
+
+    print(
+        f"finished: E/N={final_energy:.6f}, "
+        f"tail-step SD={tail_energy_standard_deviation:.6f}, "
+        f"CV={final_cv:.4e}, density L1={density_l1:.5f}, "
+        f"wall={elapsed/60.0:.1f} min",
+        flush=True,
+    )
+    print(f"outputs: {output_directory.resolve()}", flush=True)
+
+
+def main() -> None:
+    args = parse_arguments()
+    config = make_config(args.smoke)
+    device = resolve_device(args.device)
+    if device.type != "cuda" and not args.smoke:
+        print(
+            "warning: the full N=350 run is computationally intensive; "
+            "a CUDA GPU is strongly recommended",
+            flush=True,
+        )
+    run(config, device, args.output_dir)
+
+
+if __name__ == "__main__":
+    main()
