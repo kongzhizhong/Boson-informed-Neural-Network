@@ -22,13 +22,18 @@ is self-contained and requires no pretrained model or external dataset.
 
 The trial state is constructed in logarithmic form:
 
-$$
-\log\Psi_\theta(\mathbf R)
-=\sum_i\chi^{\mathrm{env}}(\mathbf r_i)
-+f^{\mathrm{TNN}}(\mathbf R)
-+\sum_{i<j}\left[u_{\mathrm c}(r_{ij})
-+\varphi_{\theta_2}(r_{ij}^{2})\right].
-$$
+```math
+\begin{aligned}
+\log \Psi_{\theta}(\mathbf{R})
+&= \sum_{i=1}^{N} \chi^{\mathrm{env}}(\mathbf{r}_i)
++ f^{\mathrm{TNN}}(\mathbf{R}) \\
+&\quad + \sum_{1 \leq i < j \leq N}
+\left[
+u_{\mathrm{c}}(r_{ij})
++ \varphi_{\theta_2}(r_{ij}^{2})
+\right].
+\end{aligned}
+```
 
 Its components have distinct roles:
 
